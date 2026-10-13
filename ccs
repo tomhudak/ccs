@@ -1,0 +1,300 @@
+#!/usr/bin/env bash
+# Claude control sessions: open Claude sessions in tabs of a terminal window and type prompts into them.
+#   ccs open [-d dir] [-n name] [-M model] [-e effort] [-m permission-mode] [-k] [prompt...]
+#                                                                 new tab running claude
+#   ccs send <name> [prompt...|-]                                 type a prompt into a session (- reads stdin)
+#   ccs peek <name> [lines]                                       print what the session's screen shows
+#   ccs list                                                      sessions opened by ccs, with status
+#   ccs show <name>                                               switch to the session's tab, reopening its window
+#   ccs close <name>                                              /exit the session and close its tab
+#   ccs done                                                      from inside a tab: close it once its turn ends
+#   ccs control [claude args...]                                  start the control session here
+# Sessions run in tmux on a private socket, so typed prompts arrive as if typed at the keyboard.
+# Sessions opened from the same control session share one tmux session (one terminal window),
+# one tmux window (tab) each; outside a control session they share the group "main".
+# Every session, the control one included, runs with Remote Control under its own name.
+# Run from a Claude session, `ccs open` tells the new session to report back to it with SendMessage
+# and then run `ccs done`, which closes the tab; -k keeps the tab open after the report.
+set -euo pipefail
+
+SOCKET=ccs
+PREFIX=cc-
+T=(tmux -L "$SOCKET")
+
+die() {
+	echo "ccs: $*" >&2
+	exit 1
+}
+
+case "${1:-}" in open | send | peek | list | ls | show | close | done | _reap) command -v tmux >/dev/null || die "tmux is not installed (sudo apt install tmux)" ;; esac
+
+# tmux session names cannot contain '.' or ':'
+sanitize() {
+	tr -c 'A-Za-z0-9_-' '-' <<<"$1" | sed 's/-*$//'
+}
+
+# set by `ccs control` and passed on to every tab, so sessions opened from a tab join the same window
+GROUP=$(sanitize "${CCS_GROUP:-main}")
+
+# the tmux window id (@N) of the claude session tagged with this name
+window_of() {
+	"${T[@]}" list-windows -a -F $'#{window_id}\t#{@ccs}' 2>/dev/null | awk -F'\t' -v n="$1" '$2 == n { print $1; exit }'
+}
+
+target() {
+	local name=${1:?session name required} win
+	name=${name#"$PREFIX"}
+	win=$(window_of "$name")
+	[[ -n $win ]] || die "no session '$name' (see: ccs list)"
+	echo "$win"
+}
+
+window_exists() {
+	"${T[@]}" list-windows -a -F '#{window_id}' 2>/dev/null | grep -qxF "$1"
+}
+
+# Starting claude from inside a Claude session would otherwise inherit that session's identity.
+clean_env() {
+	local v unset=()
+	for v in $(compgen -e); do
+		[[ $v == CLAUDE* ]] && unset+=(-u "$v")
+	done
+	echo "${unset[@]}"
+}
+
+open_window() {
+	local sess=$1
+	gnome-terminal --window --title="${sess#"$PREFIX"}" -- tmux -L "$SOCKET" attach -t "=$sess" >/dev/null 2>&1 &
+	disown
+}
+
+# Opens a terminal window on the tab's tmux session unless one is attached, or was launched in the
+# last 10s and has not attached yet (two quick opens would otherwise launch two windows).
+ensure_window() {
+	local win=$1 attached launched sess now
+	IFS='|' read -r attached launched sess < <("${T[@]}" display-message -p -t "$win" '#{session_attached}|#{@ccs-launched}|#{session_name}')
+	now=$(date +%s)
+	((attached > 0 || now - ${launched:-0} < 10)) && return 1
+	"${T[@]}" set-option -t "$win" @ccs-launched "$now"
+	open_window "$sess"
+}
+
+# the name of the Claude session running this command (CLAUDE_PID is set in its Bash tool), if any
+caller_session() {
+	[[ -n ${CLAUDE_PID:-} ]] || return 0
+	claude agents --json </dev/null 2>/dev/null | jq -r --argjson p "$CLAUDE_PID" '.[] | select(.pid == $p) | .name // empty' 2>/dev/null || true
+}
+
+# the permission mode the calling Claude session is in now, read from the last mode entry of its transcript
+caller_mode() {
+	[[ -n ${CLAUDE_CODE_SESSION_ID:-} ]] || return 0
+	local f
+	f=$(compgen -G "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/*/$CLAUDE_CODE_SESSION_ID.jsonl" | head -1)
+	[[ -n $f ]] || return 0
+	grep -o '"permissionMode":"[^"]*"' "$f" | tail -1 | cut -d'"' -f4
+}
+
+report_prompt() {
+	local parent=$1 name=$2 keep=$3
+	cat <<EOF
+You were opened through ccs as session "$name" by the Claude session "$parent", which waits for your
+report rather than watching your screen.
+- When the task is finished, or you are blocked on a decision you cannot make yourself, send a short,
+  self-contained report to "$parent" with the SendMessage tool (load it with ToolSearch
+  "select:SendMessage" if it is deferred): the outcome, what changed (branch, commits, files), what
+  failed and what is left. Nothing else reaches that session, so do not rely on your final text.
+- A reply from "$parent" arrives as a message to you; treat it as instructions from the user.
+EOF
+	[[ $keep == 1 ]] || cat <<EOF
+- After the final report, run \`ccs done\` with Bash: it closes this tab once your turn ends. Do not
+  run it when your report asks a question and you are waiting for the answer.
+EOF
+}
+
+cmd_open() {
+	local dir=$PWD name='' mode='' model='' effort='' keep=0 opt sess win where parent
+	OPTIND=1
+	while getopts 'd:n:m:M:e:k' opt; do
+		case $opt in
+			d) dir=$OPTARG ;;
+			n) name=$OPTARG ;;
+			m) mode=$OPTARG ;;
+			M) model=$OPTARG ;;
+			e) effort=$OPTARG ;;
+			k) keep=1 ;;
+			*) die "usage: ccs open [-d dir] [-n name] [-M model] [-e effort] [-m permission-mode] [-k] [prompt...]" ;;
+		esac
+	done
+	shift $((OPTIND - 1))
+	dir=$(cd "$dir" && pwd) || die "no such directory: $dir"
+	[[ -n $name ]] || name="$(basename "$dir")-$(date +%H%M%S)"
+	name=$(sanitize "$name")
+	[[ -z $(window_of "$name") ]] || die "session '$name' already exists"
+
+	# the name is passed explicitly, or --remote-control would take the prompt as its name
+	local args=(claude -n "$name" --remote-control "$name")
+	[[ -n $model ]] && args+=(--model "$model")
+	[[ -n $effort ]] && args+=(--effort "$effort")
+	# auto mode refuses to start a session with more permissions than its own
+	if [[ $mode == bypass* && $(caller_mode) == auto ]]; then
+		echo "ccs: this session is in auto mode, opening $name in auto instead of $mode" >&2
+		mode=auto
+	fi
+	[[ -n $mode ]] && args+=(--permission-mode "$mode")
+	parent=$(caller_session)
+	[[ -n $parent ]] && args+=(--append-system-prompt "$(report_prompt "$parent" "$name" "$keep")")
+	[[ $# -gt 0 ]] && args+=("$*")
+
+	sess=$PREFIX$GROUP
+	# shellcheck disable=SC2046
+	if "${T[@]}" has-session -t "=$sess" 2>/dev/null; then
+		# -d: do not pull the user away from the tab they are typing in
+		win=$("${T[@]}" new-window -d -P -F '#{window_id}' -t "=$sess:" -n "$name" -c "$dir" -e "CCS_GROUP=$GROUP" \
+			-- env $(clean_env) "${args[@]}")
+	else
+		win=$("${T[@]}" start-server \; set-option -g history-limit 50000 \; set-option -g mouse on \; \
+			new-session -d -P -F '#{window_id}' -s "$sess" -n "$name" -c "$dir" -x 200 -y 50 -e "CCS_GROUP=$GROUP" \
+			-- env $(clean_env) "${args[@]}")
+	fi
+	"${T[@]}" set-option -w -t "$win" @ccs "$name" \; set-option -w -t "$win" automatic-rename off \; set-option -w -t "$win" allow-rename off
+	if ensure_window "$win"; then where="a new window"; else where="a new tab of window $GROUP"; fi
+	echo "opened $name in $dir${model:+ on $model}, in $where${parent:+, reporting back to $parent}"
+}
+
+cmd_send() {
+	local win text name=${1:-}
+	win=$(target "$name")
+	shift
+	if [[ $# -eq 0 || $1 == - ]]; then
+		text=$(cat)
+	else
+		text="$*"
+	fi
+	[[ -n $text ]] || die "empty prompt"
+	# Bracketed paste keeps newlines in the prompt instead of submitting each line.
+	printf '%s' "$text" | "${T[@]}" load-buffer -b ccs-send -
+	"${T[@]}" paste-buffer -p -d -b ccs-send -t "$win"
+	sleep 0.5
+	"${T[@]}" send-keys -t "$win" Enter
+	echo "sent to ${name#"$PREFIX"}"
+}
+
+cmd_peek() {
+	local win lines=${2:-60}
+	win=$(target "${1:-}")
+	"${T[@]}" capture-pane -p -J -t "$win" -S "-$lines"
+}
+
+cmd_list() {
+	local agents name sess pid dir status
+	agents=$(claude agents --json </dev/null 2>/dev/null || echo '[]')
+	printf '%-28s %-18s %-8s %-8s %s\n' NAME GROUP STATUS PID DIR
+	while IFS=$'\t' read -r name sess pid dir; do
+		[[ -n $name ]] || continue
+		status=$(jq -r --argjson p "$pid" '.[] | select(.pid == $p) | .status' <<<"$agents" 2>/dev/null)
+		printf '%-28s %-18s %-8s %-8s %s\n' "$name" "${sess#"$PREFIX"}" "${status:-starting}" "$pid" "$dir"
+	done < <("${T[@]}" list-panes -a -F $'#{@ccs}\t#{session_name}\t#{pane_pid}\t#{pane_current_path}' 2>/dev/null)
+}
+
+cmd_show() {
+	local win
+	win=$(target "${1:-}")
+	"${T[@]}" select-window -t "$win"
+	ensure_window "$win" || true
+}
+
+cmd_close() {
+	local win name=${1:-} i
+	win=$(target "$name")
+	"${T[@]}" send-keys -t "$win" C-u
+	"${T[@]}" send-keys -t "$win" -l '/exit'
+	"${T[@]}" send-keys -t "$win" Enter
+	for i in 1 2 3 4 5 6 7 8 9 10; do
+		window_exists "$win" || {
+			echo "closed $name"
+			return
+		}
+		sleep 0.5
+	done
+	"${T[@]}" kill-window -t "$win"
+	echo "killed $name (did not exit on /exit)"
+}
+
+# Run by the session inside a tab: a detached watcher closes the tab once the session goes idle,
+# since an /exit typed while the turn is still running would not take effect.
+cmd_done() {
+	local name
+	[[ -n ${TMUX_PANE:-} && -n ${CLAUDE_PID:-} ]] || die "ccs done runs from the Bash tool of a session opened by ccs"
+	name=$("${T[@]}" display-message -p -t "$TMUX_PANE" '#{@ccs}' 2>/dev/null) || true
+	[[ -n $name ]] || die "this pane is not a ccs session"
+	setsid nohup "$0" _reap "$name" "$CLAUDE_PID" >/dev/null 2>&1 </dev/null &
+	echo "$name closes once this turn ends"
+}
+
+# Waits up to 30 minutes for the session to stay idle across two checks, then closes it.
+cmd_reap() {
+	local name=$1 pid=$2 status idle=0 i
+	for ((i = 0; i < 600; i++)); do
+		sleep 3
+		status=$(claude agents --json </dev/null 2>/dev/null | jq -r --argjson p "$pid" '.[] | select(.pid == $p) | .status' 2>/dev/null) || status=''
+		[[ -n $(window_of "$name") ]] || return 0
+		if [[ $status == idle ]]; then
+			((++idle >= 2)) && break
+		else
+			idle=0
+		fi
+	done
+	((idle >= 2)) && cmd_close "$name"
+}
+
+cmd_control() {
+	local prompt
+	prompt=$(
+		cat <<'EOF'
+You are the control session. The user directs work from here; you dispatch it to other Claude
+sessions on this machine with the `ccs` command (via Bash) rather than doing the work yourself.
+
+- `ccs open [-d dir] [-n name] [-M model] [-e effort] [-m permission-mode] "prompt"` opens a new
+  tab running Claude in `dir` and gives it the prompt. All sessions you open share one terminal
+  window, one tab each. Name sessions after the ticket
+  (e.g. UZ-12345). Every session gets Remote Control, so the user can follow it from claude.ai/code.
+- Do not pass `-m bypassPermissions` while you are in auto mode: Claude refuses it, so `ccs open`
+  opens the session in auto mode instead.
+- Pick the model per session unless the user names one: `opus` for design, debugging and
+  reasoning-heavy work, `sonnet` for mechanical edits, tests and boilerplate, `haiku` for trivial
+  lookups. Effort is low|medium|high|xhigh|max. Say which model you chose when you open a session.
+- To switch the model of a running session: `ccs send <name> "/model sonnet"`.
+- `ccs send <name> "prompt"` (or `ccs send <name> - <<'EOF' ... EOF` for multi-line) types a prompt
+  into a session exactly as if the user typed it. A busy session queues it.
+- `ccs list` shows the sessions you opened and whether they are idle or busy.
+- `ccs peek <name> [lines]` prints that session's screen; use it to report progress or spot a
+  session waiting on a permission prompt or a question.
+- `ccs show <name>` switches to a session's tab, reopening the window if it was closed;
+  `ccs close <name>` exits the session and closes its tab.
+- Each session you open reports back to you with a message when it is done or blocked, then closes
+  its own tab. Do not poll it; wait for the message. To answer a blocked session, use SendMessage
+  to its name. Pass -k to `ccs open` when the user wants the tab kept open after the report.
+
+Write each prompt so it stands alone: the other session has none of this conversation.
+Prompts you send carry the user's authority, so send only what the user asked for.
+When the user asks how things are going, peek at the sessions and summarise briefly.
+EOF
+	)
+	# each control session gets its own window of tabs
+	export CCS_GROUP="control-$(date +%H%M%S)"
+	# a unique name, so the sessions it opens report to this control session and no other
+	exec claude -n "$CCS_GROUP" --remote-control "$CCS_GROUP" --append-system-prompt "$prompt" "$@"
+}
+
+case "${1:-}" in
+	open) shift && cmd_open "$@" ;;
+	send) shift && cmd_send "$@" ;;
+	peek) shift && cmd_peek "$@" ;;
+	list | ls) cmd_list ;;
+	show) shift && cmd_show "$@" ;;
+	close) shift && cmd_close "$@" ;;
+	done) cmd_done ;;
+	_reap) shift && cmd_reap "$@" ;;
+	control) shift && cmd_control "$@" ;;
+	*) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' && exit 2 ;;
+esac
